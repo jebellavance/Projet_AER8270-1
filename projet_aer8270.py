@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Trace temporaire pour verifier les CL et CD des profils NACA.
+Trace temporaire pour verifier les forces L et D des profils NACA.
 
 Ce bloc est volontairement simple et pourra etre supprime/remplace plus tard
 quand le fichier principal du projet sera construit.
@@ -17,8 +17,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 
-DATA_FILE = Path(__file__).resolve().parent / "resultats_data_mesures.csv"
-OUTPUT_FILE = Path(__file__).resolve().parent / "verification_CL_CD_NACA.png"
+DATA_DIR = Path(__file__).resolve().parent / "resultats_par_vitesse"
+OUTPUT_FILE = Path(__file__).resolve().parent / "verification_L_D_NACA.png"
 
 
 def parse_float(value: str) -> float | None:
@@ -31,19 +31,19 @@ def parse_float(value: str) -> float | None:
         return None
 
 
-def read_aero_data(path: Path) -> list[dict[str, float | str]]:
+def read_aero_file(path: Path) -> list[dict[str, float | str]]:
     rows = []
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         for raw_row in reader:
             alpha = parse_float(raw_row["angle_deg"])
-            cl = parse_float(raw_row["CL"])
-            cd = parse_float(raw_row["CD"])
+            lift = parse_float(raw_row.get("L_N", raw_row.get("CL", "")))
+            drag = parse_float(raw_row.get("D_N", raw_row.get("CD", "")))
             speed = parse_float(raw_row["vitesse_ms"])
 
             if alpha is None or speed is None:
                 continue
-            if cl is None and cd is None:
+            if lift is None and drag is None:
                 continue
 
             rows.append(
@@ -51,10 +51,17 @@ def read_aero_data(path: Path) -> list[dict[str, float | str]]:
                     "profil": raw_row["profil"],
                     "vitesse_ms": speed,
                     "angle_deg": alpha,
-                    "CL": cl,
-                    "CD": cd,
+                    "L_N": lift,
+                    "D_N": drag,
                 }
             )
+    return rows
+
+
+def read_aero_data(directory: Path) -> list[dict[str, float | str]]:
+    rows = []
+    for path in sorted(directory.glob("*_interpoles.csv")):
+        rows.extend(read_aero_file(path))
     return rows
 
 
@@ -87,24 +94,24 @@ def plot_profile_data(ax, rows: list[dict[str, float | str]], profile: str, colu
 
 
 def main() -> None:
-    rows = read_aero_data(DATA_FILE)
+    rows = read_aero_data(DATA_DIR)
     profiles = sorted({str(row["profil"]) for row in rows if str(row["profil"]).startswith("NACA")})
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
 
     for profile in profiles:
-        plot_profile_data(axes[0], rows, profile, "CL")
-        plot_profile_data(axes[1], rows, profile, "CD")
+        plot_profile_data(axes[0], rows, profile, "L_N")
+        plot_profile_data(axes[1], rows, profile, "D_N")
 
-    axes[0].set_title("CL en fonction de l'angle d'attaque")
+    axes[0].set_title("Portance en fonction de l'angle d'attaque")
     axes[0].set_xlabel("Angle d'attaque [deg]")
-    axes[0].set_ylabel("CL [-]")
+    axes[0].set_ylabel("L [N]")
     axes[0].grid(True)
     axes[0].legend()
 
-    axes[1].set_title("CD en fonction de l'angle d'attaque")
+    axes[1].set_title("Trainee en fonction de l'angle d'attaque")
     axes[1].set_xlabel("Angle d'attaque [deg]")
-    axes[1].set_ylabel("CD [-]")
+    axes[1].set_ylabel("D [N]")
     axes[1].grid(True)
     axes[1].legend()
 
