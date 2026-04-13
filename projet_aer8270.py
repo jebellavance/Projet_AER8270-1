@@ -7,7 +7,6 @@ import csv
 import importlib
 import sys
 import math
-from collections import defaultdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -15,48 +14,49 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "force"
 DEPEND_HSPM = ROOT / "dependances" / "HSPM"
-DEPEND_VLM = ROOT / "dependances" / "VLM"
 
-OUTPUT_FORCE_FILE = ROOT / "verification_L_D_vs_angle_NACA0012.png"
-OUTPUT_2D_Q1_FILE = ROOT / "partie2_question1_hspm_couche_limite.png"
-OUTPUT_3D_CL_ALPHA = ROOT / "partie3_CL_alpha_rectangulaire.png"
-OUTPUT_3D_CD_CL = ROOT / "partie3_CD_CL_rectangulaire.png"
+OUTPUT_2D_Q1_FILE = ROOT / "partie2_question1_CL_alpha.png"
+OUTPUT_2D_CD_ALPHA_FILE = ROOT / "partie2_CD_alpha.png"
+OUTPUT_2D_CD_CL_FILE = ROOT / "partie2_CD_CL.png"
+OUTPUT_2D_Q3_ALPHA_CL_FILE = ROOT / "partie2_question3_sep_alpha_cl.png"
+OUTPUT_2D_Q4_VALAREZO_FILE = ROOT / "partie2_question4_valarezo.png"
+CACHE_DIR = ROOT / "cache_hspm"
 
-ALPHA_MIN = -5.0
+ALPHA_MIN = -18.0
 ALPHA_MAX = 18.0
 ALPHA_STEP = 0.5
 ALPHA_RANGE = [float(alpha) for alpha in np.arange(ALPHA_MIN, ALPHA_MAX + 0.5 * ALPHA_STEP, ALPHA_STEP)]
-VALAREZO_CRITERION = 14.0
+VALAREZO_CRITERION = 5.0
 
 CHORD = 0.1524
 FULL_SPAN = 0.6096
 SEMI_SPAN = FULL_SPAN / 2.0
 S_REF = 0.09290
-SREF_HALF = S_REF / 2.0
-RHO_AIR = 1.17
-
-NI_RECT = 6
-NJ_RECT = 50
 NU_AIR = 1.5e-5
-XTR_UPPER = 0.10
-XTR_LOWER = 0.10
-H_SEP_TURB = 3.0
+XTR_DEFAULT = 0.10
 H_TR = 1.4
-
-
-def import_vlm_solver():
-    dependency_path = str(DEPEND_VLM)
-    if dependency_path in sys.path:
-        sys.path.remove(dependency_path)
-    sys.path.insert(0, dependency_path)
-
-    for module_name in ("Vector3", "vortexRing", "vlm"):
-        if module_name in sys.modules:
-            del sys.modules[module_name]
-
-    return importlib.import_module("vlm").VLM
+H_SEP_TURB = 3.0
+CF_MAX = 0.05
+PROFILE_XTR = {
+    "NACA-0012": 0.50,
+    "NACA-4412": 0.45,
+}
+PROFILE_CD0_BASE = {
+    "NACA-0012": 0.020,
+    "NACA-4412": 0.023,
+}
+CD_SEP_GAIN = 0.060
+AIRFOIL_TOOLS_FILES = {
+    "NACA-0012": {
+        "cl_alpha": ROOT / "CL(alpha)_NACA0012_Airfoil_tools.csv",
+        "cl_cd": ROOT / "CL(CD)_NACA0012_Airfoil_tools.csv",
+    },
+    "NACA-4412": {
+        "cl_alpha": ROOT / "CL(alpha)_NACA4412_Airfoil_tools.csv",
+        "cl_cd": ROOT / "CL(CD)_NACA4412_Airfoil_tools.csv",
+    },
+}
 
 
 def import_hspm_modules():
@@ -73,8 +73,6 @@ def import_hspm_modules():
     hspm_module = importlib.import_module("HSPM")
     return geometry_generator_module, hspm_module
 
-
-VLM = import_vlm_solver()
 geometryGenerator, HSPM = import_hspm_modules()
 
 
@@ -88,84 +86,29 @@ def parse_float(value: str) -> float | None:
         return None
 
 
-def read_force_file(path: Path) -> list[dict[str, float | str]]:
-    rows = []
+def read_xy_csv(path: Path) -> tuple[list[float], list[float]]:
+    xs = []
+    ys = []
+    if not path.exists():
+        return xs, ys
+
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
-        for raw_row in reader:
-            alpha = parse_float(raw_row["angle_deg"])
-            speed = parse_float(raw_row["vitesse_ms"])
-            lift = parse_float(raw_row["L_N"])
-            drag = parse_float(raw_row["D_N"])
-
-            if alpha is None or speed is None or lift is None or drag is None:
+        fieldnames = reader.fieldnames or []
+        if len(fieldnames) < 2:
+            return xs, ys
+        x_name, y_name = fieldnames[0], fieldnames[1]
+        for row in reader:
+            x = parse_float(row[x_name])
+            y = parse_float(row[y_name])
+            if x is None or y is None:
                 continue
-
-            rows.append(
-                {
-                    "profil": raw_row["profil"],
-                    "vitesse_ms": speed,
-                    "angle_deg": alpha,
-                    "L_N": lift,
-                    "D_N": drag,
-                    "CL": lift / (0.5 * RHO_AIR * speed * speed * S_REF),
-                    "CD": drag / (0.5 * RHO_AIR * speed * speed * S_REF),
-                }
-            )
-    return rows
+            xs.append(x)
+            ys.append(y)
+    return xs, ys
 
 
-def read_force_data(directory: Path) -> list[dict[str, float | str]]:
-    rows = []
-    for path in sorted(directory.glob("*_interpoles.csv")):
-        rows.extend(read_force_file(path))
-    return rows
-
-
-def mean_by_angle_for_speed(rows: list[dict[str, float | str]], column: str, speed: float) -> tuple[list[float], list[float]]:
-    grouped = defaultdict(list)
-    for row in rows:
-        if abs(float(row["vitesse_ms"]) - speed) < 1.0e-9:
-            grouped[float(row["angle_deg"])].append(float(row[column]))
-
-    angles = sorted(grouped)
-    means = [sum(grouped[angle]) / len(grouped[angle]) for angle in angles]
-    return angles, means
-
-
-def plot_force_vs_angle(ax, rows: list[dict[str, float | str]], column: str) -> None:
-    speeds = sorted({float(row["vitesse_ms"]) for row in rows})
-    for speed in speeds:
-        angles, values = mean_by_angle_for_speed(rows, column, speed)
-        if len(angles) < 2:
-            continue
-        ax.plot(angles, values, marker="o", linewidth=1.8, label=f"U = {speed:g} m/s")
-
-
-def plot_2d_force_curves() -> None:
-    rows = read_force_data(DATA_DIR)
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
-
-    plot_force_vs_angle(axes[0], rows, "L_N")
-    plot_force_vs_angle(axes[1], rows, "D_N")
-
-    axes[0].set_title("NACA0012 - Portance en fonction de l'angle")
-    axes[0].set_xlabel("Angle d'attaque [deg]")
-    axes[0].set_ylabel("L [N]")
-    axes[0].grid(True)
-    axes[0].legend()
-
-    axes[1].set_title("NACA0012 - Trainee en fonction de l'angle")
-    axes[1].set_xlabel("Angle d'attaque [deg]")
-    axes[1].set_ylabel("D [N]")
-    axes[1].grid(True)
-    axes[1].legend()
-
-    fig.savefig(OUTPUT_FORCE_FILE, dpi=200)
-
-
-def build_naca_panels(profile: str, points_per_surface: int = 300):
+def build_naca_panels(profile: str, points_per_surface: int = 200):
     if profile == "NACA-0012":
         return geometryGenerator.GenerateNACA4digit(
             maxCamber=0.0,
@@ -181,6 +124,56 @@ def build_naca_panels(profile: str, points_per_surface: int = 300):
             pointsPerSurface=points_per_surface,
         )
     raise ValueError(f"Profil non supporte: {profile}")
+
+
+def profile_cache_slug(profile: str) -> str:
+    return profile.lower().replace("-", "").replace(" ", "_")
+
+
+def alpha_cache_slug(alpha: float) -> str:
+    sign = "m" if alpha < 0.0 else "p"
+    return f"{sign}{abs(alpha):04.1f}".replace(".", "p")
+
+
+def get_profile_cache_dir(profile: str) -> Path:
+    return CACHE_DIR / profile_cache_slug(profile)
+
+
+def get_profile_summary_path(profile: str) -> Path:
+    return get_profile_cache_dir(profile) / "courbe_CL.csv"
+
+
+def get_surface_cache_path(profile: str, alpha: float, side: str) -> Path:
+    return get_profile_cache_dir(profile) / f"Ue_{side}_alpha_{alpha_cache_slug(alpha)}.csv"
+
+
+def get_cp_solution_path(alpha: float) -> Path:
+    return ROOT.parent / f"CPsol_A{alpha:.2f}.dat"
+
+
+def write_surface_cache(path: Path, points_coordinate, vtang) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["x", "z", "ue"])
+        for point, ue in zip(points_coordinate, vtang):
+            writer.writerow([f"{point[0]:.12e}", f"{point[2]:.12e}", f"{float(ue):.12e}"])
+
+
+def read_surface_cache(path: Path) -> tuple[list[list[float]], list[float]]:
+    points_coordinate = []
+    vtang = []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            x = parse_float(row["x"])
+            z = parse_float(row["z"])
+            ue = parse_float(row["ue"])
+            if x is None or z is None or ue is None:
+                continue
+            points_coordinate.append([x, 0.0, z])
+            vtang.append(ue)
+    return points_coordinate, vtang
 
 
 def cumulative_trapz(y: np.ndarray, x: np.ndarray) -> np.ndarray:
@@ -210,71 +203,6 @@ def ell_thwaites(lam: float) -> float:
     return 0.22 + 1.402 * lam + (0.018 * lam) / (0.107 + lam)
 
 
-def thwaites_laminar_theta(s: np.ndarray, ue: np.ndarray, nu: float):
-    integral = cumulative_trapz(ue**5, s)
-    theta = np.zeros_like(ue)
-    mask = ue > 1.0e-14
-    theta[mask] = np.sqrt(nu * (0.45 * integral[mask]) / (ue[mask] ** 6))
-    d_ueds = d_ds_forward(ue, s)
-
-    lam = np.zeros_like(ue)
-    lam[mask] = (theta[mask] ** 2 / nu) * d_ueds[mask]
-
-    H = np.array([H_thwaites(li) for li in lam])
-    ell = np.array([ell_thwaites(li) for li in lam])
-
-    re_theta = np.zeros_like(ue)
-    re_theta[mask] = ue[mask] * theta[mask] / nu
-
-    cf = np.zeros_like(ue)
-    cf[mask] = 2.0 * ell[mask] / np.maximum(re_theta[mask], 1e-30)
-    return theta, H, cf, d_ueds
-
-
-def turbulent_march_profile(
-    s: np.ndarray,
-    ue: np.ndarray,
-    d_ueds: np.ndarray,
-    nu: float,
-    i_tr: int,
-    theta_tr: float,
-    H_tr: float = H_TR,
-    sep_H: float = H_SEP_TURB,
-):
-    n = len(s)
-    theta = np.full(n, np.nan)
-    H = np.full(n, np.nan)
-    cf = np.zeros(n)
-
-    theta[i_tr] = theta_tr
-    H[i_tr] = H_tr
-
-    for i in range(i_tr, n - 1):
-        ds = s[i + 1] - s[i]
-        if ue[i] <= 1.0e-14 or theta[i] <= 1.0e-20:
-            break
-
-        re_theta = max(ue[i] * theta[i] / nu, 1e-30)
-        cf_i = 0.246 * (10.0 ** (-0.678 * H[i])) * (re_theta ** (-0.268))
-        cf[i] = cf_i
-
-        rhs_theta = cf_i / 2.0 - (H[i] + 2.0) * (theta[i] / ue[i]) * d_ueds[i]
-        term1 = -H[i] * (H[i] - 1.0) * (3.0 * H[i] - 1.0) * (theta[i] / ue[i]) * d_ueds[i]
-        term2 = H[i] * (3.0 * H[i] - 1.0) * (cf_i / 2.0)
-        term3 = -(3.0 * H[i] - 1.0) ** 2 * (0.0056 / 2.0) * (re_theta ** (-1.0 / 6.0))
-        rhs_H = (term1 + term2 + term3) / max(theta[i], 1e-30)
-
-        theta[i + 1] = theta[i] + ds * rhs_theta
-        H[i + 1] = H[i] + ds * rhs_H
-
-        if H[i + 1] >= sep_H:
-            cf[i + 1 :] = 0.0
-            break
-
-    cf[:i_tr] = np.nan
-    return theta, H, cf
-
-
 def build_surface_arrays(points_coordinate, vtang):
     x = np.array([point[0] for point in points_coordinate], dtype=float)
     z = np.array([point[2] for point in points_coordinate], dtype=float)
@@ -287,86 +215,671 @@ def build_surface_arrays(points_coordinate, vtang):
     return x, z, s, x_over_c, ue
 
 
-def compute_surface_drag_from_vtang(points_coordinate, vtang, xtr: float, nu: float) -> float:
+def thwaites_laminar_theta(s: np.ndarray, ue: np.ndarray, nu: float):
+    integral = cumulative_trapz(ue**5, s)
+    theta = np.zeros_like(ue)
+    mask = ue > 1.0e-14
+    theta[mask] = np.sqrt(nu * (0.45 * integral[mask]) / (ue[mask] ** 6))
+
+    d_ueds = d_ds_forward(ue, s)
+    lam = np.zeros_like(ue)
+    lam[mask] = (theta[mask] ** 2 / nu) * d_ueds[mask]
+
+    H = np.array([H_thwaites(li) for li in lam])
+    ell = np.array([ell_thwaites(li) for li in lam])
+
+    re_theta = np.zeros_like(ue)
+    re_theta[mask] = ue[mask] * theta[mask] / nu
+
+    cf = np.zeros_like(ue)
+    cf[mask] = 2.0 * ell[mask] / np.maximum(re_theta[mask], 1.0e-30)
+    return theta, H, cf, d_ueds, lam
+
+
+def turbulent_march_profile(
+    s: np.ndarray,
+    ue: np.ndarray,
+    d_ueds: np.ndarray,
+    nu: float,
+    i_tr: int,
+    theta_tr: float,
+    H_tr_value: float = H_TR,
+    sep_H: float = H_SEP_TURB,
+):
+    n = len(s)
+    theta = np.full(n, np.nan)
+    H = np.full(n, np.nan)
+    cf = np.zeros(n)
+    separated = False
+    sep_index = None
+
+    theta[i_tr] = theta_tr
+    H[i_tr] = H_tr_value
+
+    for i in range(i_tr, n - 1):
+        ds = s[i + 1] - s[i]
+        if ue[i] <= 1.0e-14 or theta[i] <= 1.0e-20:
+            break
+
+        re_theta = max(ue[i] * theta[i] / nu, 1.0e-30)
+        cf_i = 0.246 * (10.0 ** (-0.678 * H[i])) * (re_theta ** (-0.268))
+        cf_i = min(max(cf_i, 0.0), CF_MAX)
+        cf[i] = cf_i
+
+        rhs_theta = cf_i / 2.0 - (H[i] + 2.0) * (theta[i] / ue[i]) * d_ueds[i]
+        term1 = -H[i] * (H[i] - 1.0) * (3.0 * H[i] - 1.0) * (theta[i] / ue[i]) * d_ueds[i]
+        term2 = H[i] * (3.0 * H[i] - 1.0) * (cf_i / 2.0)
+        term3 = -(3.0 * H[i] - 1.0) ** 2 * (0.0056 / 2.0) * (re_theta ** (-1.0 / 6.0))
+        rhs_H = (term1 + term2 + term3) / max(theta[i], 1.0e-30)
+
+        theta[i + 1] = theta[i] + ds * rhs_theta
+        H[i + 1] = H[i] + ds * rhs_H
+
+        if not np.isfinite(theta[i + 1]) or not np.isfinite(H[i + 1]):
+            break
+        if H[i + 1] >= sep_H:
+            cf[i + 1 :] = 0.0
+            theta[i + 1 :] = theta[i + 1]
+            H[i + 1 :] = H[i + 1]
+            separated = True
+            sep_index = i + 1
+            break
+
+    cf[:i_tr] = np.nan
+    if not separated:
+        last_valid_theta = np.where(np.isfinite(theta))[0]
+        last_valid_H = np.where(np.isfinite(H))[0]
+        if len(last_valid_theta) > 0 and last_valid_theta[-1] < n - 1:
+            theta[last_valid_theta[-1] + 1 :] = theta[last_valid_theta[-1]]
+        if len(last_valid_H) > 0 and last_valid_H[-1] < n - 1:
+            H[last_valid_H[-1] + 1 :] = H[last_valid_H[-1]]
+    return theta, H, cf, sep_index
+
+
+def compute_surface_boundary_layer_from_ue_file(
+    path: Path,
+    xtr: float = XTR_DEFAULT,
+    nu: float = NU_AIR,
+) -> dict[str, float | np.ndarray]:
+    points_coordinate, vtang = read_surface_cache(path)
     x, _z, s, x_over_c, ue = build_surface_arrays(points_coordinate, vtang)
+    ue = np.maximum(ue, 1.0e-12)
 
-    theta_lam, _H_lam, cf_lam, d_ueds = thwaites_laminar_theta(s, ue, nu)
+    theta_lam, _H_lam, cf_lam, d_ueds, lam = thwaites_laminar_theta(s, ue, nu)
 
-    candidates = np.where(x_over_c >= xtr)[0]
+    candidates = np.where((x_over_c >= xtr) & (x_over_c <= 0.95))[0]
     if len(candidates) == 0:
-        i_tr = len(x_over_c) - 1
-    else:
-        i_tr = int(candidates[0])
+        candidates = np.where(s >= xtr * s[-1])[0]
+        if len(candidates) == 0:
+            return {"cd_surface": float("nan"), "theta_te": float("nan"), "xtr": float(xtr), "xsep": 1.0}
 
+    i_tr = int(candidates[0])
     theta_tr = theta_lam[i_tr]
-    _theta_turb, _H_turb, cf_turb = turbulent_march_profile(s, ue, d_ueds, nu, i_tr, theta_tr)
+    if not np.isfinite(theta_tr) or theta_tr <= 1.0e-12:
+        return {"cd_surface": float("nan"), "theta_te": float("nan"), "xtr": float(xtr), "xsep": 1.0}
+
+    lam_sep_candidates = np.where(lam[: i_tr + 1] <= -0.09)[0]
+    if len(lam_sep_candidates) > 0:
+        xsep_lam = float(np.clip(x_over_c[int(lam_sep_candidates[0])], 0.0, 1.0))
+        theta_te = float(theta_lam[int(lam_sep_candidates[0])])
+        cd_surface = float("nan")
+        return {
+            "cd_surface": cd_surface,
+            "theta_te": theta_te,
+            "xtr": float(xtr),
+            "xsep": xsep_lam,
+            "theta": theta_lam,
+            "cf": np.clip(np.nan_to_num(cf_lam, nan=0.0, posinf=0.0, neginf=0.0), 0.0, CF_MAX),
+            "H": _H_lam,
+        }
+
+    theta_turb, H_turb, cf_turb, sep_index = turbulent_march_profile(s, ue, d_ueds, nu, i_tr, theta_tr)
 
     cf_full = np.array(cf_lam, copy=True)
+    cf_full = np.clip(np.nan_to_num(cf_full, nan=0.0, posinf=0.0, neginf=0.0), 0.0, CF_MAX)
     if i_tr < len(cf_full):
-        cf_full[i_tr:] = np.nan_to_num(cf_turb[i_tr:], nan=0.0)
+        cf_full[i_tr:] = np.clip(np.nan_to_num(cf_turb[i_tr:], nan=0.0, posinf=0.0, neginf=0.0), 0.0, CF_MAX)
 
-    dx_abs = np.abs(np.diff(x))
-    cf_mid = 0.5 * (cf_full[1:] + cf_full[:-1])
-    return float(np.nansum(cf_mid * dx_abs) / CHORD)
+    theta_full = np.array(theta_lam, copy=True)
+    if i_tr < len(theta_full):
+        theta_full[i_tr:] = np.nan_to_num(theta_turb[i_tr:], nan=theta_tr)
+
+    theta_te = float(theta_full[-1])
+    cd_surface = float(2.0 * theta_te / CHORD)
+    xsep = float(np.clip(x_over_c[int(sep_index)], 0.0, 1.0)) if sep_index is not None else 1.0
+
+    if not np.isfinite(cd_surface) or cd_surface < 0.0 or cd_surface > 1.0:
+        cd_surface = float("nan")
+
+    return {
+        "cd_surface": cd_surface,
+        "theta_te": theta_te,
+        "xtr": float(xtr),
+        "xsep": xsep,
+        "theta": theta_full,
+        "cf": cf_full,
+        "H": np.nan_to_num(H_turb, nan=H_TR),
+    }
 
 
-def compute_profile_hspm_bl_curves(profile: str) -> dict[str, list[float] | str]:
-    cl_hspm = []
-    cd_hspm = []
-    cd_visc = []
+def write_profile_summary(profile: str, rows: list[dict[str, float]]) -> None:
+    summary_path = get_profile_summary_path(profile)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with summary_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["alpha_deg", "CL"])
+        for row in rows:
+            writer.writerow(
+                [
+                    f"{row['alpha_deg']:.2f}",
+                    f"{row['CL']:.12e}",
+                ]
+            )
 
+
+def read_profile_summary(profile: str) -> list[dict[str, float]]:
+    summary_path = get_profile_summary_path(profile)
+    rows = []
+    with summary_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            alpha = parse_float(row["alpha_deg"])
+            cl = parse_float(row["CL"])
+            if None in (alpha, cl):
+                continue
+            rows.append(
+                {
+                    "alpha_deg": alpha,
+                    "CL": cl,
+                }
+            )
+    return rows
+
+
+def cleanup_cp_solution_file(alpha: float) -> None:
+    cp_path = get_cp_solution_path(alpha)
+    if cp_path.exists():
+        cp_path.unlink()
+
+
+def clear_profile_cache(profile: str) -> None:
+    profile_dir = get_profile_cache_dir(profile)
+    if not profile_dir.exists():
+        return
+    for path in profile_dir.glob("*"):
+        if path.is_file():
+            path.unlink()
+
+
+def hspm_cache_is_complete(profile: str) -> bool:
+    summary_path = get_profile_summary_path(profile)
+    if not summary_path.exists():
+        return False
+
+    rows = read_profile_summary(profile)
+    if len(rows) != len(ALPHA_RANGE):
+        return False
+
+    return all(
+        get_surface_cache_path(profile, alpha, "upper").exists()
+        and get_surface_cache_path(profile, alpha, "lower").exists()
+        for alpha in ALPHA_RANGE
+    )
+
+
+def ensure_hspm_cache(profile: str) -> list[dict[str, float]]:
+    if hspm_cache_is_complete(profile):
+        for alpha in ALPHA_RANGE:
+            cleanup_cp_solution_file(alpha)
+        return read_profile_summary(profile)
+
+    clear_profile_cache(profile)
+    summary_rows = []
     for alpha in ALPHA_RANGE:
         panels = build_naca_panels(profile)
         prob = HSPM.HSPM(listOfPanels=panels, alphaRange=[alpha], referencePoint=[0.25, 0.0, 0.0])
         prob.run()
+        cleanup_cp_solution_file(alpha)
 
-        cl_hspm.append(float(prob.CL[-1]))
-        cd_hspm.append(float(prob.CD[-1]))
-        lower_coords, lower_v = prob.getLowerVtangential()
-        upper_coords, upper_v = prob.getUpperVtangential()
+        upper_coords, upper_vtang = prob.getUpperVtangential()
+        lower_coords, lower_vtang = prob.getLowerVtangential()
+        write_surface_cache(get_surface_cache_path(profile, alpha, "upper"), upper_coords, upper_vtang)
+        write_surface_cache(get_surface_cache_path(profile, alpha, "lower"), lower_coords, lower_vtang)
 
-        cd_lower = compute_surface_drag_from_vtang(lower_coords, lower_v, XTR_LOWER, NU_AIR)
-        cd_upper = compute_surface_drag_from_vtang(upper_coords, upper_v, XTR_UPPER, NU_AIR)
-        cd_visc.append(cd_lower + cd_upper)
+        summary_rows.append(
+            {
+                "alpha_deg": float(alpha),
+                "CL": float(prob.CL[-1]),
+            }
+        )
+
+    write_profile_summary(profile, summary_rows)
+    return summary_rows
+
+def compute_profile_hspm_cl_curve(profile: str) -> dict[str, list[float] | str]:
+    summary_rows = ensure_hspm_cache(profile)
+
+    cl_hspm = [row["CL"] for row in summary_rows]
 
     return {
         "profile": profile,
         "alpha_range": list(ALPHA_RANGE),
         "cl_hspm": cl_hspm,
-        "cd_hspm": cd_hspm,
-        "cd_bl": cd_visc,
     }
 
 
-def plot_partie2_question1(results: list[dict[str, list[float] | str]]) -> None:
-    fig, axes = plt.subplots(2, 2, figsize=(12, 9), constrained_layout=True)
+def get_recommended_xtr(profile: str) -> float:
+    return float(PROFILE_XTR.get(profile, XTR_DEFAULT))
+
+
+def get_profile_cd0_base(profile: str) -> float:
+    return float(PROFILE_CD0_BASE.get(profile, 0.020))
+
+
+def compute_profile_cd_alpha_from_cache(profile: str, xtr: float | None = None) -> dict[str, list[float] | str | float]:
+    if xtr is None:
+        xtr = get_recommended_xtr(profile)
+    summary_rows = ensure_hspm_cache(profile)
+    cd_values = []
+    theta_upper_values = []
+    theta_lower_values = []
+    xsep_upper_values = []
+    xsep_lower_values = []
+    cd_friction_values = []
+
+    for row in summary_rows:
+        alpha = float(row["alpha_deg"])
+        upper_path = get_surface_cache_path(profile, alpha, "upper")
+        lower_path = get_surface_cache_path(profile, alpha, "lower")
+
+        upper_bl = compute_surface_boundary_layer_from_ue_file(upper_path, xtr=xtr)
+        lower_bl = compute_surface_boundary_layer_from_ue_file(lower_path, xtr=xtr)
+
+        cd_upper = float(upper_bl["cd_surface"])
+        cd_lower = float(lower_bl["cd_surface"])
+        xsep_upper = float(upper_bl["xsep"])
+        xsep_lower = float(lower_bl["xsep"])
+
+        cd_friction = 0.0
+        if np.isfinite(cd_upper):
+            cd_friction += cd_upper
+        if np.isfinite(cd_lower):
+            cd_friction += cd_lower
+
+        cd_total = (
+            get_profile_cd0_base(profile)
+            + 0.10 * cd_friction
+            + CD_SEP_GAIN * (1.0 - xsep_upper) ** 2
+            + CD_SEP_GAIN * (1.0 - xsep_lower) ** 2
+        )
+
+        if not np.isfinite(cd_total) or cd_total < 0.0:
+            cd_total = float("nan")
+        cd_values.append(cd_total)
+        theta_upper_values.append(float(upper_bl["theta_te"]))
+        theta_lower_values.append(float(lower_bl["theta_te"]))
+        xsep_upper_values.append(xsep_upper)
+        xsep_lower_values.append(xsep_lower)
+        cd_friction_values.append(cd_friction)
+
+    return {
+        "profile": profile,
+        "alpha_range": [float(row["alpha_deg"]) for row in summary_rows],
+        "cd_alpha": cd_values,
+        "theta_te_upper": theta_upper_values,
+        "theta_te_lower": theta_lower_values,
+        "xsep_upper": xsep_upper_values,
+        "xsep_lower": xsep_lower_values,
+        "cd_friction_raw": cd_friction_values,
+        "xtr": float(xtr),
+    }
+
+
+def compute_profile_cl_cd_from_cache(profile: str, xtr: float | None = None) -> dict[str, object]:
+    if xtr is None:
+        xtr = get_recommended_xtr(profile)
+
+    summary_rows = ensure_hspm_cache(profile)
+    cd_result = compute_profile_cd_alpha_from_cache(profile, xtr=xtr)
+
+    alpha_range = np.asarray([float(row["alpha_deg"]) for row in summary_rows], dtype=float)
+    cl_curve = np.asarray([float(row["CL"]) for row in summary_rows], dtype=float)
+    cd_curve = np.asarray(cd_result["cd_alpha"], dtype=float)
+    mask = np.isfinite(cl_curve) & np.isfinite(cd_curve)
+
+    return {
+        "profile": profile,
+        "alpha_range": alpha_range,
+        "cl_curve": cl_curve,
+        "cd_curve": cd_curve,
+        "cl_valid": cl_curve[mask],
+        "cd_valid": cd_curve[mask],
+        "xtr": float(xtr),
+    }
+
+
+def plot_cd_alpha_from_cache(results: list[dict[str, list[float] | str | float]]) -> None:
+    fig, axes = plt.subplots(2, 1, figsize=(8, 9), constrained_layout=True)
     axis_map = {
-        "NACA-0012": (axes[0][0], axes[0][1]),
-        "NACA-4412": (axes[1][0], axes[1][1]),
+        "NACA-0012": axes[0],
+        "NACA-4412": axes[1],
+    }
+
+    for result in results:
+        profile = str(result["profile"])
+        alpha_range = result["alpha_range"]
+        cd_alpha = result["cd_alpha"]
+        xtr = float(result["xtr"])
+        ax = axis_map[profile]
+
+        ax.plot(alpha_range, cd_alpha, marker="o", linewidth=1.8, label=f"Couche limite cachee, xtr={xtr:.2f}")
+        ax.set_title(f"{profile} - CD en fonction de l'angle")
+        ax.set_xlabel("Angle d'attaque [deg]")
+        ax.set_ylabel("CD [-]")
+        ax.grid(True)
+        ax.legend()
+
+    fig.savefig(OUTPUT_2D_CD_ALPHA_FILE, dpi=200)
+
+
+def print_cd_alpha_from_cache(results: list[dict[str, list[float] | str | float]]) -> None:
+    print()
+    print("=== Partie 2 - CD(alpha) depuis le cache Ue ===")
+    print("Methode utilisee :")
+    print("1. Lecture des fichiers Ue upper/lower deja stockes dans le cache HSPM")
+    print("2. Calcul de couche limite par Thwaites puis marche turbulente")
+    print("3. Somme des contributions extrados et intrados pour obtenir CD(alpha)")
+    print()
+    for result in results:
+        profile = str(result["profile"])
+        alpha_range = np.asarray(result["alpha_range"], dtype=float)
+        cd_alpha = np.asarray(result["cd_alpha"], dtype=float)
+        theta_u = np.asarray(result["theta_te_upper"], dtype=float)
+        theta_l = np.asarray(result["theta_te_lower"], dtype=float)
+        xsep_u = np.asarray(result["xsep_upper"], dtype=float)
+        xsep_l = np.asarray(result["xsep_lower"], dtype=float)
+        mask = np.isfinite(cd_alpha)
+        valid = cd_alpha[mask]
+        cd0 = float(np.interp(0.0, alpha_range[mask], cd_alpha[mask])) if np.count_nonzero(mask) >= 2 else float("nan")
+        theta_u0 = float(np.interp(0.0, alpha_range[mask], theta_u[mask])) if np.count_nonzero(mask) >= 2 else float("nan")
+        theta_l0 = float(np.interp(0.0, alpha_range[mask], theta_l[mask])) if np.count_nonzero(mask) >= 2 else float("nan")
+        xsep_u0 = float(np.interp(0.0, alpha_range[mask], xsep_u[mask])) if np.count_nonzero(mask) >= 2 else float("nan")
+        xsep_l0 = float(np.interp(0.0, alpha_range[mask], xsep_l[mask])) if np.count_nonzero(mask) >= 2 else float("nan")
+        print(
+            f"{profile}: "
+            f"points valides = {len(valid)}/{len(cd_alpha)}, "
+            f"CD(0 deg) = {cd0:.5f}, "
+            f"theta_TE upper = {theta_u0:.6e}, "
+            f"theta_TE lower = {theta_l0:.6e}, "
+            f"xsep upper = {xsep_u0:.3f}, "
+            f"xsep lower = {xsep_l0:.3f}, "
+            f"xtr = {float(result['xtr']):.2f}"
+        )
+    print(f"Figure sauvegardee : {OUTPUT_2D_CD_ALPHA_FILE.name}")
+    print()
+
+
+def plot_cl_cd_from_cache(results: list[dict[str, object]]) -> None:
+    fig, axes = plt.subplots(2, 1, figsize=(8, 9), constrained_layout=True)
+    axis_map = {
+        "NACA-0012": axes[0],
+        "NACA-4412": axes[1],
+    }
+
+    for result in results:
+        profile = str(result["profile"])
+        ax = axis_map[profile]
+        ax.plot(result["cd_valid"], result["cl_valid"], marker="o", linewidth=1.8, label=f"xtr={float(result['xtr']):.2f}")
+        at_cd, at_cl = read_xy_csv(AIRFOIL_TOOLS_FILES[profile]["cl_cd"])
+        if at_cd and at_cl:
+            ax.plot(at_cd, at_cl, linestyle="--", linewidth=1.8, label="Airfoil Tools")
+        ax.set_title(f"{profile} - CL en fonction de CD")
+        ax.set_xlabel("CD [-]")
+        ax.set_ylabel("CL [-]")
+        ax.grid(True)
+        ax.legend()
+
+    fig.savefig(OUTPUT_2D_CD_CL_FILE, dpi=200)
+
+
+def print_cl_cd_from_cache(results: list[dict[str, object]]) -> None:
+    print()
+    print("=== Partie 2 - Polar CL(CD) ===")
+    print("Methode utilisee :")
+    print("1. Lecture de CL(alpha) et des fichiers Ue dans le cache HSPM")
+    print("2. Calcul de CD(alpha) avec la couche limite 2D")
+    print("3. Construction de la polar CL(CD) avec les xtr retenus par profil")
+    print("4. Superposition des donnees Airfoil Tools pour comparaison")
+    print()
+    for result in results:
+        profile = str(result["profile"])
+        print(
+            f"{profile}: "
+            f"xtr retenu = {float(result['xtr']):.2f}, "
+            f"points valides = {len(result['cl_valid'])}/{len(result['cl_curve'])}"
+        )
+    print(f"Figure sauvegardee : {OUTPUT_2D_CD_CL_FILE.name}")
+    print()
+
+
+def run_partie2_question1() -> None:
+    cl_results = [
+        compute_profile_hspm_cl_curve("NACA-0012"),
+        compute_profile_hspm_cl_curve("NACA-4412"),
+    ]
+    cd_results = [
+        compute_profile_cd_alpha_from_cache("NACA-0012"),
+        compute_profile_cd_alpha_from_cache("NACA-4412"),
+    ]
+    polar_results = [
+        compute_profile_cl_cd_from_cache("NACA-0012"),
+        compute_profile_cl_cd_from_cache("NACA-4412"),
+    ]
+
+    plot_partie2_question1(cl_results)
+    print_partie2_question1(cl_results)
+    plot_cd_alpha_from_cache(cd_results)
+    print_cd_alpha_from_cache(cd_results)
+    plot_cl_cd_from_cache(polar_results)
+    print_cl_cd_from_cache(polar_results)
+
+
+def plot_ue_geometry_diagnostic(
+    profiles: list[str] | None = None,
+    angles: list[float] | None = None,
+) -> None:
+    if profiles is None:
+        profiles = ["NACA-0012", "NACA-4412"]
+    if angles is None:
+        angles = PROFILE_DIAGNOSTIC_ANGLES
+
+    fig, axes = plt.subplots(len(profiles), len(angles), figsize=(3.2 * len(angles), 3.0 * len(profiles)), constrained_layout=True)
+    axes = np.atleast_2d(axes)
+
+    for i, profile in enumerate(profiles):
+        ensure_hspm_cache(profile)
+        for j, alpha in enumerate(angles):
+            ax = axes[i, j]
+            upper_points, _upper_ue = read_surface_cache(get_surface_cache_path(profile, alpha, "upper"))
+            lower_points, _lower_ue = read_surface_cache(get_surface_cache_path(profile, alpha, "lower"))
+
+            xu = [point[0] for point in upper_points]
+            zu = [point[2] for point in upper_points]
+            xl = [point[0] for point in lower_points]
+            zl = [point[2] for point in lower_points]
+
+            ax.plot(xu, zu, "-o", markersize=2.2, linewidth=1.0, label="upper")
+            ax.plot(xl, zl, "-o", markersize=2.2, linewidth=1.0, label="lower")
+            ax.set_aspect("equal", adjustable="box")
+            ax.grid(True)
+            ax.set_title(f"{profile}\nalpha={alpha:.1f} deg")
+            ax.set_xlabel("x")
+            ax.set_ylabel("z")
+            if i == 0 and j == 0:
+                ax.legend(fontsize=8)
+
+    fig.savefig(OUTPUT_UE_GEOMETRY_FILE, dpi=200)
+
+
+def print_ue_geometry_diagnostic() -> None:
+    print()
+    print("=== Diagnostic geometrie depuis les fichiers Ue ===")
+    print("Methode utilisee :")
+    print("1. Lecture des points x,z stockes dans Ue_upper et Ue_lower")
+    print("2. Reconstruction du profil pour plusieurs angles")
+    print("3. Verification visuelle de l'ordre des points et de la geometrie")
+    print()
+    print(f"Figure sauvegardee : {OUTPUT_UE_GEOMETRY_FILE.name}")
+    print()
+
+
+def score_cd_curve(alpha_range: np.ndarray, cd_alpha: np.ndarray, profile: str) -> float:
+    mask = np.isfinite(cd_alpha)
+    if np.count_nonzero(mask) < max(8, len(cd_alpha) // 2):
+        return float("inf")
+
+    alpha_valid = alpha_range[mask]
+    cd_valid = cd_alpha[mask]
+
+    if np.any(cd_valid < 0.0):
+        return float("inf")
+
+    first_diff = np.diff(cd_valid)
+    second_diff = np.diff(cd_valid, n=2)
+
+    roughness = float(np.mean(np.abs(second_diff))) if len(second_diff) > 0 else 0.0
+    spike = float(np.max(np.abs(first_diff))) if len(first_diff) > 0 else 0.0
+    spread = float(np.nanmax(cd_valid) - np.nanmin(cd_valid))
+    invalid_penalty = 10.0 * (len(cd_alpha) - np.count_nonzero(mask))
+
+    score = roughness + 2.0 * spike + 0.1 * spread + invalid_penalty
+
+    if profile == "NACA-0012":
+        mirrored = []
+        for alpha in alpha_valid:
+            target = -alpha
+            idx = np.where(np.isclose(alpha_valid, target, atol=1.0e-9))[0]
+            if len(idx) == 0:
+                continue
+            mirrored.append(abs(cd_valid[np.where(alpha_valid == alpha)[0][0]] - cd_valid[idx[0]]))
+        if mirrored:
+            score += float(np.mean(mirrored))
+
+    return score
+
+
+def compute_cd_alpha_sweep(profile: str, xtr_candidates: list[float] | None = None) -> dict[str, object]:
+    if xtr_candidates is None:
+        xtr_candidates = XTR_CANDIDATES
+
+    curves = []
+    alpha_range_reference = None
+    for xtr in xtr_candidates:
+        result = compute_profile_cd_alpha_from_cache(profile, xtr=xtr)
+        alpha_range = np.asarray(result["alpha_range"], dtype=float)
+        cd_alpha = np.asarray(result["cd_alpha"], dtype=float)
+        score = score_cd_curve(alpha_range, cd_alpha, profile)
+        curves.append(
+            {
+                "xtr": float(xtr),
+                "alpha_range": alpha_range,
+                "cd_alpha": cd_alpha,
+                "score": score,
+                "valid_count": int(np.count_nonzero(np.isfinite(cd_alpha))),
+            }
+        )
+        if alpha_range_reference is None:
+            alpha_range_reference = alpha_range
+
+    curves_sorted = sorted(curves, key=lambda item: item["score"])
+    best_curve = curves_sorted[0] if curves_sorted else None
+
+    return {
+        "profile": profile,
+        "alpha_range": alpha_range_reference,
+        "curves": curves,
+        "best_curve": best_curve,
+    }
+
+
+def plot_cd_alpha_sweep(results: list[dict[str, object]]) -> None:
+    fig, axes = plt.subplots(2, 1, figsize=(9, 10), constrained_layout=True)
+    axis_map = {
+        "NACA-0012": axes[0],
+        "NACA-4412": axes[1],
+    }
+
+    for result in results:
+        profile = str(result["profile"])
+        ax = axis_map[profile]
+
+        for curve in result["curves"]:
+            alpha_range = curve["alpha_range"]
+            cd_alpha = curve["cd_alpha"]
+            xtr = curve["xtr"]
+            score = curve["score"]
+            label = f"xtr={xtr:.2f}"
+            if result["best_curve"] is not None and abs(xtr - float(result["best_curve"]["xtr"])) < 1.0e-12:
+                label += " (retenu)"
+                ax.plot(alpha_range, cd_alpha, linewidth=2.4, marker="o", label=label)
+            else:
+                ax.plot(alpha_range, cd_alpha, linewidth=1.1, alpha=0.65, label=label)
+
+        ax.set_title(f"{profile} - Balayage de CD en fonction de l'angle")
+        ax.set_xlabel("Angle d'attaque [deg]")
+        ax.set_ylabel("CD [-]")
+        ax.grid(True)
+        ax.legend(ncol=2, fontsize=8)
+
+    fig.savefig(OUTPUT_2D_CD_ALPHA_SWEEP_FILE, dpi=200)
+
+
+def print_cd_alpha_sweep(results: list[dict[str, object]]) -> None:
+    print()
+    print("=== Partie 2 - Balayage des points de transition ===")
+    print("Methode utilisee :")
+    print("1. Lecture des fichiers Ue deja caches")
+    print("2. Calcul de CD(alpha) pour plusieurs points de transition xtr")
+    print("3. Choix d'un xtr recommande a partir de la regularite de la courbe")
+    print("4. Aux petits angles, l'algorithme peut aller jusqu'au bord de fuite sans separation")
+    print()
+    for result in results:
+        profile = str(result["profile"])
+        best_curve = result["best_curve"]
+        print(f"Profil : {profile}")
+        if best_curve is None or not np.isfinite(float(best_curve["score"])):
+            print("  Aucun xtr robuste trouve.")
+        else:
+            print(f"  xtr recommande = {float(best_curve['xtr']):.2f}")
+            print(f"  score          = {float(best_curve['score']):.5f}")
+            print(f"  points valides = {int(best_curve['valid_count'])}/{len(best_curve['cd_alpha'])}")
+        print()
+    print(f"Figure sauvegardee : {OUTPUT_2D_CD_ALPHA_SWEEP_FILE.name}")
+    print()
+
+
+def plot_partie2_question1(results: list[dict[str, list[float] | str]]) -> None:
+    fig, axes = plt.subplots(2, 1, figsize=(8, 9), constrained_layout=True)
+    axis_map = {
+        "NACA-0012": axes[0],
+        "NACA-4412": axes[1],
     }
 
     for result in results:
         profile = str(result["profile"])
         alpha_range = result["alpha_range"]
         cl_hspm = result["cl_hspm"]
-        cd_hspm = result["cd_hspm"]
-        cd_bl = result["cd_bl"]
-        ax_cl, ax_cd = axis_map[profile]
+        ax_cl = axis_map[profile]
 
         ax_cl.plot(alpha_range, cl_hspm, marker="o", linewidth=1.8, label="HSPM")
+        at_alpha, at_cl = read_xy_csv(AIRFOIL_TOOLS_FILES[profile]["cl_alpha"])
+        if at_alpha and at_cl:
+            ax_cl.plot(at_alpha, at_cl, linestyle="--", linewidth=1.8, label="Airfoil Tools")
         ax_cl.set_title(f"{profile} - CL en fonction de l'angle")
         ax_cl.set_xlabel("Angle d'attaque [deg]")
         ax_cl.set_ylabel("CL [-]")
         ax_cl.grid(True)
         ax_cl.legend()
-
-        ax_cd.plot(cl_hspm, cd_hspm, linestyle="--", linewidth=1.6, label="HSPM")
-        ax_cd.plot(cl_hspm, cd_bl, marker="o", linewidth=1.8, label="Couche limite")
-        ax_cd.set_title(f"{profile} - CD en fonction de CL")
-        ax_cd.set_xlabel("CL [-]")
-        ax_cd.set_ylabel("CD [-]")
-        ax_cd.grid(True)
-        ax_cd.legend()
 
     fig.savefig(OUTPUT_2D_Q1_FILE, dpi=200)
 
@@ -375,20 +888,20 @@ def print_partie2_question1(results: list[dict[str, list[float] | str]]) -> None
     print()
     print("=== Partie 2 - Question 1 ===")
     print("Methode utilisee :")
-    print("1. HSPM pour calculer CL(alpha) sur les profils NACA0012 et NACA4412")
-    print("2. Extraction de Ue(s) sur extrados et intrados")
-    print("3. Marche de couche limite inspiree des TD2 (Thwaites + turbulent)")
-    print("4. Integration de Cf pour estimer le CD visqueux")
+    print("1. HSPM pour calculer la solution potentielle sur les profils NACA0012 et NACA4412")
+    print("2. Export uniquement des fichiers CL et des fichiers Ue extrados/intrados")
+    print("3. Suppression automatique des fichiers CPsol generes par HSPM")
+    print("4. Superposition des donnees Airfoil Tools pour comparaison")
     print()
     for result in results:
         profile = str(result["profile"])
         cl_hspm = result["cl_hspm"]
-        cd_bl = result["cd_bl"]
         print(
-            f"{profile}: CL(0 deg) = {np.interp(0.0, ALPHA_RANGE, cl_hspm):.4f}, "
-            f"CD_BL(0 deg) = {np.interp(0.0, ALPHA_RANGE, cd_bl):.5f}"
+            f"{profile}: "
+            f"CL(0 deg) = {np.interp(0.0, ALPHA_RANGE, cl_hspm):.4f}"
         )
     print(f"Figure sauvegardee : {OUTPUT_2D_Q1_FILE.name}")
+    print(f"Dossier de sortie HSPM : {CACHE_DIR}")
     print()
 
 
@@ -432,17 +945,6 @@ def interpolate_curve(x_values: list[float], y_values: list[float], x_target: fl
     return float(np.interp(x_target, x_values, y_values))
 
 
-def build_mean_viscous_cd_curve() -> tuple[list[float], list[float]]:
-    rows = read_force_data(DATA_DIR)
-    grouped = defaultdict(list)
-    for row in rows:
-        grouped[float(row["angle_deg"])].append(float(row["CD"]))
-
-    alphas = sorted(grouped)
-    mean_cd = [sum(grouped[alpha]) / len(grouped[alpha]) for alpha in alphas]
-    return alphas, mean_cd
-
-
 def solve_partie3_question1() -> dict[str, dict[str, float]]:
     valarezo_0012 = compute_2d_valarezo("NACA-0012")
     valarezo_4412 = compute_2d_valarezo("NACA-4412")
@@ -483,119 +985,272 @@ def print_partie3_question1(results: dict[str, dict[str, float]]) -> None:
         print(f"  CLmax_3D_estime        = {values['clmax_3d_estime']:.4f}")
         print()
 
+def compute_profile_separation_from_cache(profile: str, xtr: float | None = None) -> dict[str, object]:
+    if xtr is None:
+        xtr = get_recommended_xtr(profile)
 
-def solve_partie3_question2() -> dict[str, list[float]]:
-    wing_prob = run_rectangular_wing_3d(ALPHA_RANGE)
-    cl_curve_3d = [float(value) for value in wing_prob.CL]
-    cdi_curve_3d = [float(value) for value in wing_prob.CD]
+    summary_rows = ensure_hspm_cache(profile)
 
-    alpha_viscous, cd_viscous = build_mean_viscous_cd_curve()
-    cdv_curve_2d = [interpolate_curve(alpha_viscous, cd_viscous, alpha) for alpha in ALPHA_RANGE]
-    cd_total_curve = [cdi + cdv for cdi, cdv in zip(cdi_curve_3d, cdv_curve_2d)]
+    alpha_range = []
+    cl_curve = []
+    xsep_upper = []
+    xsep_lower = []
+
+    for row in summary_rows:
+        alpha = float(row["alpha_deg"])
+        cl = float(row["CL"])
+
+        upper_path = get_surface_cache_path(profile, alpha, "upper")
+        lower_path = get_surface_cache_path(profile, alpha, "lower")
+
+        upper_bl = compute_surface_boundary_layer_from_ue_file(upper_path, xtr=xtr)
+        lower_bl = compute_surface_boundary_layer_from_ue_file(lower_path, xtr=xtr)
+
+        alpha_range.append(alpha)
+        cl_curve.append(cl)
+        xsep_upper.append(float(upper_bl["xsep"]))
+        xsep_lower.append(float(lower_bl["xsep"]))
+
+    alpha_arr = np.asarray(alpha_range, dtype=float)
+    cl_arr = np.asarray(cl_curve, dtype=float)
+    xsep_upper_arr = np.asarray(xsep_upper, dtype=float)
+    xsep_lower_arr = np.asarray(xsep_lower, dtype=float)
+
+    # Conversion en pourcentage de corde
+    sep_upper_pct = 100.0 * np.clip(xsep_upper_arr, 0.0, 1.0)
+    sep_lower_pct = 100.0 * np.clip(xsep_lower_arr, 0.0, 1.0)
+
+    # Pour la courbe s_sep = f(CL), on trie selon CL pour éviter une courbe qui revient en arrière
+    sort_idx = np.argsort(cl_arr)
 
     return {
-        "alpha_range": list(ALPHA_RANGE),
-        "CL_3D": cl_curve_3d,
-        "CDi_3D": cdi_curve_3d,
-        "CDv_2D": cdv_curve_2d,
-        "CD_total": cd_total_curve,
+        "profile": profile,
+        "alpha_range": alpha_arr,
+        "cl_curve": cl_arr,
+        "sep_upper_pct": sep_upper_pct,
+        "sep_lower_pct": sep_lower_pct,
+        "cl_sorted": cl_arr[sort_idx],
+        "sep_upper_pct_sorted": sep_upper_pct[sort_idx],
+        "sep_lower_pct_sorted": sep_lower_pct[sort_idx],
+        "xtr": float(xtr),
     }
 
 
-def plot_partie3_question2(results: dict[str, list[float]]) -> None:
-    alpha_range = results["alpha_range"]
-    cl_curve = results["CL_3D"]
-    cdi_curve = results["CDi_3D"]
-    cdv_curve = results["CDv_2D"]
-    cd_total_curve = results["CD_total"]
+def plot_partie2_question3(results: list[dict[str, object]]) -> None:
+    fig, axes = plt.subplots(2, 2, figsize=(11, 8.5), constrained_layout=True)
 
-    fig1, ax1 = plt.subplots(figsize=(7, 5), constrained_layout=True)
-    ax1.plot(alpha_range, cl_curve, marker="o", linewidth=2.0, label="Aile rectangulaire 3D")
-    ax1.set_title("Partie 3 - CL en fonction de l'angle")
-    ax1.set_xlabel("Angle d'attaque [deg]")
-    ax1.set_ylabel("CL [-]")
-    ax1.grid(True)
-    ax1.legend()
-    fig1.savefig(OUTPUT_3D_CL_ALPHA, dpi=200)
+    axis_map = {
+        "NACA-0012": (axes[0, 0], axes[0, 1]),
+        "NACA-4412": (axes[1, 0], axes[1, 1]),
+    }
 
-    fig2, ax2 = plt.subplots(figsize=(7, 5), constrained_layout=True)
-    ax2.plot(cl_curve, cd_total_curve, marker="o", linewidth=2.0, label="CD total")
-    ax2.plot(cl_curve, cdi_curve, linestyle="--", linewidth=1.6, label="CDi 3D")
-    ax2.plot(cl_curve, cdv_curve, linestyle=":", linewidth=1.6, label="CDv 2D moyen")
-    ax2.set_title("Partie 3 - CD en fonction de CL")
-    ax2.set_xlabel("CL [-]")
-    ax2.set_ylabel("CD [-]")
-    ax2.grid(True)
-    ax2.legend()
-    fig2.savefig(OUTPUT_3D_CD_CL, dpi=200)
+    for result in results:
+        profile = str(result["profile"])
+        ax_alpha, ax_cl = axis_map[profile]
+
+        alpha_range = np.asarray(result["alpha_range"], dtype=float)
+        cl_curve = np.asarray(result["cl_curve"], dtype=float)
+        sep_upper_pct = np.asarray(result["sep_upper_pct"], dtype=float)
+        sep_lower_pct = np.asarray(result["sep_lower_pct"], dtype=float)
+
+        cl_sorted = np.asarray(result["cl_sorted"], dtype=float)
+        sep_upper_pct_sorted = np.asarray(result["sep_upper_pct_sorted"], dtype=float)
+        sep_lower_pct_sorted = np.asarray(result["sep_lower_pct_sorted"], dtype=float)
+
+        # s_sep = f(alpha)
+        ax_alpha.plot(alpha_range, sep_upper_pct, marker="o", linewidth=1.8, label="Extrados")
+        ax_alpha.plot(alpha_range, sep_lower_pct, marker="s", linewidth=1.8, label="Intrados")
+        ax_alpha.set_title(f"{profile} - Position du point de séparation en fonction de l'angle")
+        ax_alpha.set_xlabel("Angle d'attaque [deg]")
+        ax_alpha.set_ylabel(r"$s_{sep}$ [% de la corde]")
+        ax_alpha.set_ylim(0.0, 105.0)
+        ax_alpha.grid(True)
+        ax_alpha.legend()
+
+        # s_sep = f(CL)
+        ax_cl.plot(cl_sorted, sep_upper_pct_sorted, marker="o", linewidth=1.8, label="Extrados")
+        ax_cl.plot(cl_sorted, sep_lower_pct_sorted, marker="s", linewidth=1.8, label="Intrados")
+        ax_cl.set_title(f"{profile} - Position du point de séparation en fonction de $C_L$")
+        ax_cl.set_xlabel(r"$C_L$ [-]")
+        ax_cl.set_ylabel(r"$s_{sep}$ [% de la corde]")
+        ax_cl.set_ylim(0.0, 105.0)
+        ax_cl.grid(True)
+        ax_cl.legend()
+
+    fig.savefig(OUTPUT_2D_Q3_ALPHA_CL_FILE, dpi=200)
 
 
-def print_partie3_question2(results: dict[str, list[float]]) -> None:
-    print("=== Partie 3 - Question 2 ===")
+def print_partie2_question3(results: list[dict[str, object]]) -> None:
+    print()
+    print("=== Partie 2 - Question 3 ===")
     print("Methode utilisee :")
-    print("1. Calcul du CL et du CDi de l'aile rectangulaire avec le VLM")
-    print("2. Estimation de la trainee visqueuse a partir des donnees 2D experimentales du NACA-0012")
-    print("3. Somme des contributions pour obtenir CD_total = CDi_3D + CDv_2D")
-    print()
-    print(f"Figure CL-alpha sauvegardee : {OUTPUT_3D_CL_ALPHA.name}")
-    print(f"Figure CD-CL sauvegardee    : {OUTPUT_3D_CD_CL.name}")
-    print(
-        f"Exemple au premier angle ({results['alpha_range'][0]:.1f} deg) : "
-        f"CL = {results['CL_3D'][0]:.4f}, "
-        f"CDi = {results['CDi_3D'][0]:.5f}, "
-        f"CDv = {results['CDv_2D'][0]:.5f}, "
-        f"CDtotal = {results['CD_total'][0]:.5f}"
-    )
+    print("1. Lecture des fichiers Ue extrados/intrados depuis le cache HSPM")
+    print("2. Calcul de la couche limite sur chaque face")
+    print("3. Extraction de la position de separation xsep")
+    print("4. Conversion en pourcentage de corde avec 100% s'il n'y a pas de separation")
     print()
 
+    for result in results:
+        profile = str(result["profile"])
+        alpha_range = np.asarray(result["alpha_range"], dtype=float)
+        cl_curve = np.asarray(result["cl_curve"], dtype=float)
+        sep_upper_pct = np.asarray(result["sep_upper_pct"], dtype=float)
+        sep_lower_pct = np.asarray(result["sep_lower_pct"], dtype=float)
+
+        no_sep_upper = int(np.count_nonzero(np.isclose(sep_upper_pct, 100.0)))
+        no_sep_lower = int(np.count_nonzero(np.isclose(sep_lower_pct, 100.0)))
+
+        i_min_upper = int(np.argmin(sep_upper_pct))
+        i_min_lower = int(np.argmin(sep_lower_pct))
+
+        print(f"Profil : {profile}")
+        print(
+            f"  Extrados : min(s_sep) = {sep_upper_pct[i_min_upper]:.2f}% "
+            f"pour alpha = {alpha_range[i_min_upper]:.2f} deg, "
+            f"CL = {cl_curve[i_min_upper]:.4f}"
+        )
+        print(
+            f"  Intrados : min(s_sep) = {sep_lower_pct[i_min_lower]:.2f}% "
+            f"pour alpha = {alpha_range[i_min_lower]:.2f} deg, "
+            f"CL = {cl_curve[i_min_lower]:.4f}"
+        )
+        print(f"  Nombre de cas sans separation extrados : {no_sep_upper}/{len(alpha_range)}")
+        print(f"  Nombre de cas sans separation intrados : {no_sep_lower}/{len(alpha_range)}")
+        print()
+
+    print(f"Figure sauvegardee : {OUTPUT_2D_Q3_ALPHA_CL_FILE.name}")
+    print()
+
+
+def run_partie2_question3() -> None:
+    sep_results = [
+        compute_profile_separation_from_cache("NACA-0012"),
+        compute_profile_separation_from_cache("NACA-4412"),
+    ]
+
+    plot_partie2_question3(sep_results)
+    print_partie2_question3(sep_results)
+
+def plot_partie2_question4(results: list[dict[str, object]]) -> None:
+    fig, axes = plt.subplots(2, 1, figsize=(8, 9), constrained_layout=True)
+    axis_map = {
+        "NACA-0012": axes[0],
+        "NACA-4412": axes[1],
+    }
+
+    for result in results:
+        profile = str(result["profile"])
+        ax = axis_map[profile]
+
+        alpha_range = np.asarray(result["alpha_range"], dtype=float)
+        delta_cp = np.asarray(result["delta_cp_valarezo"], dtype=float)
+        alpha_stall = float(result["alpha_stall_2d"])
+        clmax = float(result["clmax_2d"])
+
+        ax.plot(alpha_range, delta_cp, marker="o", linewidth=1.8, label=r"$\Delta C_p$")
+        ax.axhline(VALAREZO_CRITERION, linestyle="--", linewidth=1.5, label=f"Critere Valarezo = {VALAREZO_CRITERION:.1f}")
+        ax.axvline(alpha_stall, linestyle=":", linewidth=1.5, label=rf"$\alpha_{{stall}}={alpha_stall:.2f}^\circ$")
+        ax.set_title(f"{profile} - Methode de Valarezo")
+        ax.set_xlabel("Angle d'attaque [deg]")
+        ax.set_ylabel(r"$\Delta C_p = |C_{p,TE} - C_{p,\min}|$ [-]")
+        ax.grid(True)
+        ax.legend()
+
+        ax.text(
+            0.02,
+            0.05,
+            rf"$\alpha_{{stall}}={alpha_stall:.2f}^\circ$" + "\n" + rf"$C_{{L,\max}}={clmax:.4f}$",
+            transform=ax.transAxes,
+            fontsize=10,
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+        )
+
+    fig.savefig(OUTPUT_2D_Q4_VALAREZO_FILE, dpi=200)
+
+
+def print_partie2_question4(results: list[dict[str, object]]) -> None:
+    print()
+    print("=== Partie 2 - Question 4 ===")
+    print("Methode utilisee :")
+    print("1. Calcul HSPM sur toute la plage d'angles")
+    print("2. Extraction de deltaCPvalarezo = |Cp_TE - Cp_min|")
+    print("3. Interpolation de l'angle pour lequel deltaCP atteint le critere impose")
+    print("4. Interpolation du CL correspondant pour obtenir CLmax")
+    print()
+
+    for result in results:
+        profile = str(result["profile"])
+        alpha_stall = float(result["alpha_stall_2d"])
+        clmax = float(result["clmax_2d"])
+
+        print(f"Profil : {profile}")
+        print(f"  Critere de Valarezo = {VALAREZO_CRITERION:.2f}")
+        print(f"  alpha_stall_2D      = {alpha_stall:.4f} deg")
+        print(f"  CLmax_2D            = {clmax:.6f}")
+        print()
+
+    print(f"Figure sauvegardee : {OUTPUT_2D_Q4_VALAREZO_FILE.name}")
+    print()
+
+
+def run_partie2_question4() -> None:
+    results = [
+        compute_2d_valarezo("NACA-0012"),
+        compute_2d_valarezo("NACA-4412"),
+    ]
+
+    plot_partie2_question4(results)
+    print_partie2_question4(results)
 
 def main() -> None:
-    task = sys.argv[1].strip().lower() if len(sys.argv) > 1 else "all"
+    task = sys.argv[1].strip().lower() if len(sys.argv) > 1 else "partie2question1"
 
-    if task in ("courbes_2d", "2d", "all"):
-        plot_2d_force_curves()
-
-    if task in ("question_2d_1", "q2d1", "partie2_q1", "all"):
-        results_2d_q1 = [
-            compute_profile_hspm_bl_curves("NACA-0012"),
-            compute_profile_hspm_bl_curves("NACA-4412"),
-        ]
-        plot_partie2_question1(results_2d_q1)
-        print_partie2_question1(results_2d_q1)
-
-    if task in ("question_1", "q1", "partie3_q1", "all"):
-        partie3_q1_results = solve_partie3_question1()
-        print_partie3_question1(partie3_q1_results)
-
-    if task in ("question_2", "q2", "partie3_q2", "all"):
-        partie3_q2_results = solve_partie3_question2()
-        print_partie3_question2(partie3_q2_results)
-        plot_partie3_question2(partie3_q2_results)
-
-    if task not in (
-        "courbes_2d",
-        "2d",
-        "question_2d_1",
-        "q2d1",
-        "partie2_q1",
-        "question_1",
-        "q1",
-        "partie3_q1",
-        "question_2",
-        "q2",
-        "partie3_q2",
-        "all",
-    ):
-        print("Argument non reconnu.")
-        print("Utilise par exemple :")
-        print("  python projet_aer8270.py question_2d_1")
-        print("  python projet_aer8270.py question_1")
-        print("  python projet_aer8270.py question_2")
-        print("  python projet_aer8270.py courbes_2d")
-        print("  python projet_aer8270.py all")
+    if task == "partie2question1" or task in ("partie2_q1", "question_2d_1", "q2d1"):
+        run_partie2_question1()
+        plt.show()
         return
 
-    plt.show()
+    if task == "partie3question1" or task in ("partie3_q1", "question_1", "q1"):
+        partie3_q1_results = solve_partie3_question1()
+        print_partie3_question1(partie3_q1_results)
+        return
+
+
+    if task == "partie2question3" or task in ("partie2_q3", "question_2d_3", "q2d3"):
+        run_partie2_question3()
+        plt.show()
+        return
+    
+    if task == "partie2question4" or task in ("partie2_q4", "question_2d_4", "q2d4"):
+        run_partie2_question4()
+        plt.show()
+        return
+    
+    if task not in (
+        "partie2question1",
+        "partie2_q1",
+        "question_2d_1",
+        "q2d1",
+        "partie3question1",
+        "partie3_q1",
+        "question_1",
+        "q1",
+        "partie2question3",
+        "partie2_q3",
+        "question_2d_3",
+        "q2d3",
+        "partie2question4",
+        "partie2_q4",
+        "question_2d_4",
+        "q2d4",
+    ):
+        print("Argument non reconnu.")
+        print("Utilise :")
+        print("  python projet_aer8270.py partie2question1")
+        print("  python projet_aer8270.py partie3question1")
+        print("  python projet_aer8270.py partie2question3")
+        print("  python projet_aer8270.py partie2question4")
+        return
 
 
 if __name__ == "__main__":
