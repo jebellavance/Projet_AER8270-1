@@ -21,6 +21,8 @@ OUTPUT_2D_CD_ALPHA_FILE = ROOT / "partie2_CD_alpha.png"
 OUTPUT_2D_CD_CL_FILE = ROOT / "partie2_CD_CL.png"
 OUTPUT_2D_Q3_ALPHA_CL_FILE = ROOT / "partie2_question3_sep_alpha_cl.png"
 OUTPUT_2D_Q4_VALAREZO_FILE = ROOT / "partie2_question4_valarezo.png"
+OUTPUT_3D_Q2_CL_ALPHA_FILE = ROOT / "partie3_question2_CL_alpha_rect.png"
+OUTPUT_3D_Q2_CD_CL_FILE = ROOT / "partie3_question2_CD_CL_rect.png"
 CACHE_DIR = ROOT / "cache_hspm"
 
 ALPHA_MIN = -18.0
@@ -75,6 +77,39 @@ def import_hspm_modules():
 
 geometryGenerator, HSPM = import_hspm_modules()
 
+
+def import_vlm_module():
+    candidate_paths = [
+        ROOT / "dependances" / "VLM",
+        ROOT / "dependances" / "vlm",
+        ROOT,
+    ]
+
+    inserted = []
+    for path in candidate_paths:
+        path_str = str(path)
+        if path.exists() and path_str not in sys.path:
+            sys.path.insert(0, path_str)
+            inserted.append(path_str)
+
+    if "vlm" in sys.modules:
+        del sys.modules["vlm"]
+
+    try:
+        vlm_module = importlib.import_module("vlm")
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Impossible d'importer le module 'vlm'. "
+            "Vérifie que vlm.py est bien présent dans le dossier du projet "
+            "ou dans dependances/VLM."
+        ) from exc
+
+    return vlm_module
+
+
+geometryGenerator, HSPM = import_hspm_modules()
+VLM_module = import_vlm_module()
+VLM = VLM_module.VLM
 
 def parse_float(value: str) -> float | None:
     value = value.strip()
@@ -906,18 +941,37 @@ def print_partie2_question1(results: list[dict[str, list[float] | str]]) -> None
 
 
 def compute_2d_valarezo(profile: str, criterion: float = VALAREZO_CRITERION) -> dict[str, object]:
-    panels = build_naca_panels(profile)
-    prob = HSPM.HSPM(listOfPanels=panels, alphaRange=ALPHA_RANGE, referencePoint=[0.25, 0.0, 0.0])
+    panels = build_naca_panels(profile, points_per_surface=400)
+    prob = HSPM.HSPM(
+        listOfPanels=panels,
+        alphaRange=ALPHA_RANGE,
+        referencePoint=[0.25, 0.0, 0.0],
+    )
     prob.run()
-    alpha_max, cl_max = prob.findAlphaMaxClMax(valarezoCriterion=criterion)
+
+    delta_cp = np.asarray(prob.deltaCPvalarezo, dtype=float)
+    cl_curve = np.asarray(prob.CL, dtype=float)
+    alpha_arr = np.asarray(ALPHA_RANGE, dtype=float)
+
+    criterion_reached = bool(np.max(delta_cp) >= criterion)
+
+    if criterion_reached:
+        alpha_max, cl_max = prob.findAlphaMaxClMax(valarezoCriterion=criterion)
+        alpha_max = float(alpha_max)
+        cl_max = float(cl_max)
+    else:
+        alpha_max = float("nan")
+        cl_max = float("nan")
 
     return {
         "profile": profile,
-        "alpha_range": list(ALPHA_RANGE),
-        "cl_curve_2d": list(prob.CL),
-        "delta_cp_valarezo": list(prob.deltaCPvalarezo),
-        "alpha_stall_2d": float(alpha_max),
-        "clmax_2d": float(cl_max),
+        "alpha_range": list(alpha_arr),
+        "cl_curve_2d": list(cl_curve),
+        "delta_cp_valarezo": list(delta_cp),
+        "alpha_stall_2d": alpha_max,
+        "clmax_2d": cl_max,
+        "criterion_reached": criterion_reached,
+        "delta_cp_max": float(np.max(delta_cp)),
     }
 
 
@@ -950,19 +1004,27 @@ def solve_partie3_question1() -> dict[str, dict[str, float]]:
     valarezo_4412 = compute_2d_valarezo("NACA-4412")
 
     wing_prob = run_rectangular_wing_3d(ALPHA_RANGE)
-    cl_curve_3d = [float(value) for value in wing_prob.CL]
+    cl_curve_3d = np.asarray([float(value) for value in wing_prob.CL], dtype=float)
+    alpha_arr = np.asarray(ALPHA_RANGE, dtype=float)
 
     results = {}
     for result in (valarezo_0012, valarezo_4412):
         profile = str(result["profile"])
         alpha_stall_2d = float(result["alpha_stall_2d"])
         clmax_2d = float(result["clmax_2d"])
-        clmax_3d_estime = interpolate_curve(ALPHA_RANGE, cl_curve_3d, alpha_stall_2d)
+        criterion_reached = bool(result["criterion_reached"])
+
+        if criterion_reached and np.isfinite(alpha_stall_2d):
+            clmax_3d_estime = float(np.interp(alpha_stall_2d, alpha_arr, cl_curve_3d))
+        else:
+            clmax_3d_estime = float("nan")
 
         results[profile] = {
             "alpha_stall_2d": alpha_stall_2d,
             "clmax_2d": clmax_2d,
             "clmax_3d_estime": clmax_3d_estime,
+            "criterion_reached": criterion_reached,
+            "delta_cp_max": float(result["delta_cp_max"]),
         }
 
     return results
@@ -974,15 +1036,19 @@ def print_partie3_question1(results: dict[str, dict[str, float]]) -> None:
     print("Methode utilisee :")
     print("1. Calcul 2D avec HSPM")
     print("2. Extraction de alpha_stall avec la methode de Valarezo")
-    print("3. Transposition de cet angle au cas 3D")
-    print("4. Lecture du CL de l'aile rectangulaire 3D a cet angle")
+    print("3. Verification que le critere est bien atteint")
+    print("4. Transposition de cet angle au cas 3D rectangulaire")
     print()
 
     for profile, values in results.items():
         print(f"Profil : {profile}")
-        print(f"  alpha_stall_2D_Valarezo = {values['alpha_stall_2d']:.3f} deg")
-        print(f"  CLmax_2D_Valarezo      = {values['clmax_2d']:.4f}")
-        print(f"  CLmax_3D_estime        = {values['clmax_3d_estime']:.4f}")
+        if not values["criterion_reached"]:
+            print("  Critere de Valarezo non atteint sur la plage d'angles calculee.")
+            print(f"  max(deltaCp)           = {values['delta_cp_max']:.4f}")
+        else:
+            print(f"  alpha_stall_2D_Valarezo = {values['alpha_stall_2d']:.3f} deg")
+            print(f"  CLmax_2D_Valarezo      = {values['clmax_2d']:.4f}")
+            print(f"  CLmax_3D_estime        = {values['clmax_3d_estime']:.4f}")
         print()
 
 def compute_profile_separation_from_cache(profile: str, xtr: float | None = None) -> dict[str, object]:
@@ -1193,6 +1259,8 @@ def print_partie2_question4(results: list[dict[str, object]]) -> None:
     print()
 
 
+
+
 def run_partie2_question4() -> None:
     results = [
         compute_2d_valarezo("NACA-0012"),
@@ -1201,6 +1269,135 @@ def run_partie2_question4() -> None:
 
     plot_partie2_question4(results)
     print_partie2_question4(results)
+
+
+def compute_rectangular_wing_3d_curves(profile: str) -> dict[str, object]:
+    wing_prob = run_rectangular_wing_3d(ALPHA_RANGE)
+
+    alpha_range = np.asarray(ALPHA_RANGE, dtype=float)
+    cl_3d = np.asarray([float(value) for value in wing_prob.CL], dtype=float)
+    cd_induced_3d = np.asarray([float(value) for value in wing_prob.CD], dtype=float)
+
+    cd_2d_result = compute_profile_cd_alpha_from_cache(profile)
+    cd_viscous_2d = np.asarray(cd_2d_result["cd_alpha"], dtype=float)
+
+    # Trainee totale = trainee induite 3D + trainee visqueuse du profil
+    cd_total_3d = cd_induced_3d + cd_viscous_2d
+
+    mask = np.isfinite(cl_3d) & np.isfinite(cd_total_3d)
+
+    return {
+        "profile": profile,
+        "alpha_range": alpha_range,
+        "cl_3d": cl_3d,
+        "cd_induced_3d": cd_induced_3d,
+        "cd_viscous_2d": cd_viscous_2d,
+        "cd_total_3d": cd_total_3d,
+        "cl_valid": cl_3d[mask],
+        "cd_valid": cd_total_3d[mask],
+    }
+
+
+def plot_partie3_question2(results: list[dict[str, object]]) -> None:
+    fig1, axes1 = plt.subplots(2, 1, figsize=(8, 9), constrained_layout=True)
+    fig2, axes2 = plt.subplots(2, 1, figsize=(8, 9), constrained_layout=True)
+
+    axis_map_1 = {
+        "NACA-0012": axes1[0],
+        "NACA-4412": axes1[1],
+    }
+    axis_map_2 = {
+        "NACA-0012": axes2[0],
+        "NACA-4412": axes2[1],
+    }
+
+    for result in results:
+        profile = str(result["profile"])
+
+        ax1 = axis_map_1[profile]
+        ax2 = axis_map_2[profile]
+
+        alpha_range = np.asarray(result["alpha_range"], dtype=float)
+        cl_3d = np.asarray(result["cl_3d"], dtype=float)
+        cd_valid = np.asarray(result["cd_valid"], dtype=float)
+        cl_valid = np.asarray(result["cl_valid"], dtype=float)
+
+        # CL-alpha 3D
+        ax1.plot(alpha_range, cl_3d, marker="o", linewidth=1.8, label="Aile rectangulaire 3D")
+
+        cl_2d = compute_profile_hspm_cl_curve(profile)
+        ax1.plot(
+            np.asarray(cl_2d["alpha_range"], dtype=float),
+            np.asarray(cl_2d["cl_hspm"], dtype=float),
+            linestyle="--",
+            linewidth=1.8,
+            label="Profil 2D HSPM",
+        )
+
+        ax1.set_title(f"{profile} - $C_L$ en fonction de $\\alpha$")
+        ax1.set_xlabel("Angle d'attaque [deg]")
+        ax1.set_ylabel(r"$C_L$ [-]")
+        ax1.grid(True)
+        ax1.legend()
+
+        # CD-CL 3D
+        ax2.plot(cd_valid, cl_valid, marker="o", linewidth=1.8, label="Aile rectangulaire 3D")
+
+        polar_2d = compute_profile_cl_cd_from_cache(profile)
+        ax2.plot(
+            np.asarray(polar_2d["cd_valid"], dtype=float),
+            np.asarray(polar_2d["cl_valid"], dtype=float),
+            linestyle="--",
+            linewidth=1.8,
+            label="Profil 2D",
+        )
+
+        ax2.set_title(f"{profile} - $C_L$ en fonction de $C_D$")
+        ax2.set_xlabel(r"$C_D$ [-]")
+        ax2.set_ylabel(r"$C_L$ [-]")
+        ax2.grid(True)
+        ax2.legend()
+
+    fig1.savefig(OUTPUT_3D_Q2_CL_ALPHA_FILE, dpi=200)
+    fig2.savefig(OUTPUT_3D_Q2_CD_CL_FILE, dpi=200)
+
+
+def print_partie3_question2(results: list[dict[str, object]]) -> None:
+    print()
+    print("=== Partie 3 - Question 2 ===")
+    print("Methode utilisee :")
+    print("1. Calcul VLM pour l'aile rectangulaire")
+    print("2. Recuperation de CL(alpha) et de la trainee induite 3D")
+    print("3. Ajout de la trainee visqueuse 2D issue de la couche limite")
+    print("4. Construction de CD_total_3D = CD_induit_3D + CD_visqueux_2D")
+    print()
+
+    for result in results:
+        profile = str(result["profile"])
+        alpha_range = np.asarray(result["alpha_range"], dtype=float)
+        cl_3d = np.asarray(result["cl_3d"], dtype=float)
+        cd_total_3d = np.asarray(result["cd_total_3d"], dtype=float)
+
+        cl0 = float(np.interp(0.0, alpha_range, cl_3d))
+        cd0 = float(np.interp(0.0, alpha_range, cd_total_3d))
+
+        print(f"Profil : {profile}")
+        print(f"  CL_3D(0 deg)        = {cl0:.6f}")
+        print(f"  CD_total_3D(0 deg)  = {cd0:.6f}")
+        print()
+
+    print(f"Figure sauvegardee : {OUTPUT_3D_Q2_CL_ALPHA_FILE.name}")
+    print(f"Figure sauvegardee : {OUTPUT_3D_Q2_CD_CL_FILE.name}")
+    print()
+
+
+def run_partie3_question2() -> None:
+    results = [
+        compute_rectangular_wing_3d_curves("NACA-0012"),
+        compute_rectangular_wing_3d_curves("NACA-4412"),
+    ]
+    plot_partie3_question2(results)
+    print_partie3_question2(results)
 
 def main() -> None:
     task = sys.argv[1].strip().lower() if len(sys.argv) > 1 else "partie2question1"

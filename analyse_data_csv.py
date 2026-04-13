@@ -12,9 +12,15 @@ from pathlib import Path
 
 TARGET_PROFILE = "NACA-0012"
 G = 9.80665
+ANGLE_MIN_DEG = -5.0
+ANGLE_MAX_DEG = 15.0
 INTERPOLATION_STEP_DEG = 0.5
-OUTPUT_BY_SPEED = "resultats_par_vitesse"
-COLUMNS = ["profil", "vitesse_ms", "angle_deg", "L_kg", "D_kg", "L_N", "D_N"]
+
+FORCE_DIR = "force"
+PRESSURE_DIR = "pression"
+
+FORCE_COLUMNS = ["profil", "vitesse_ms", "angle_deg", "L_kg", "D_kg", "L_N", "D_N"]
+PRESSURE_COLUMNS = ["profil", "vitesse_ms", "angle_deg", "pression_PSI"]
 
 
 def parse_float(value: str) -> float | None:
@@ -64,13 +70,30 @@ def is_force_header(row: list[str]) -> bool:
     return any("lift" in label for label in labels) and any("drag" in label for label in labels)
 
 
+def is_pressure_header(row: list[str]) -> bool:
+    return any(cell.strip().lower().startswith("p1") for cell in row)
+
+
 def row_has_new_block(row: list[str]) -> bool:
     text = " ".join(row).lower()
-    return "donnees" in text or "données" in text or "vitesse" in text or is_force_header(row)
+    return "donn" in text or "vitesse" in text or is_force_header(row) or is_pressure_header(row)
 
 
 def non_empty(row: list[str]) -> list[str]:
     return [cell for cell in row if cell.strip()]
+
+
+def angle_in_range(angle: float) -> bool:
+    return ANGLE_MIN_DEG <= angle <= ANGLE_MAX_DEG
+
+
+def frange(start: float, stop: float, step: float) -> list[float]:
+    values = []
+    value = start
+    while value <= stop + 1.0e-9:
+        values.append(round(value, 6))
+        value += step
+    return values
 
 
 def add_force_rows(
@@ -103,7 +126,7 @@ def add_force_rows(
         if angle is None:
             break
 
-        if airfoil == TARGET_PROFILE:
+        if airfoil == TARGET_PROFILE and angle_in_range(angle):
             for lift_col, drag_col, speed_ms in force_columns:
                 lift_kg = parse_float(row[lift_col]) if lift_col < len(row) else None
                 drag_kg = parse_float(row[drag_col]) if drag_col < len(row) else None
@@ -118,9 +141,40 @@ def add_force_rows(
     return i
 
 
-def parse_data_file(csv_path: Path) -> list[dict[str, float | str | None]]:
+def add_pressure_rows(
+    rows: list[list[str]],
+    start_index: int,
+    airfoil: str,
+    speed_ms: float | None,
+    records: dict[tuple[str, float, float], list[float]],
+) -> int:
+    i = start_index + 1
+    while i < len(rows):
+        row = rows[i]
+        if not non_empty(row):
+            break
+        if row_has_new_block(row):
+            break
+
+        angle = parse_float(row[0]) if row else None
+        pressure_values = [parse_float(value) for value in row[1:]]
+        pressure_values = [value for value in pressure_values if value is not None]
+
+        if angle is None or speed_ms is None or len(pressure_values) < 2:
+            break
+
+        if airfoil == TARGET_PROFILE and angle_in_range(angle):
+            key = (airfoil, speed_ms, angle)
+            records[key].append(mean(pressure_values))
+
+        i += 1
+    return i
+
+
+def parse_data_file(csv_path: Path) -> tuple[list[dict[str, float | str | None]], list[dict[str, float | str | None]]]:
     rows = read_csv_rows(csv_path)
-    records = defaultdict(lambda: {"L_kg": [], "D_kg": []})
+    force_records = defaultdict(lambda: {"L_kg": [], "D_kg": []})
+    pressure_records = defaultdict(list)
 
     airfoil = ""
     last_speeds: list[float] = []
@@ -137,19 +191,24 @@ def parse_data_file(csv_path: Path) -> list[dict[str, float | str | None]]:
             last_speeds = speeds
 
         if is_force_header(row):
-            i = add_force_rows(rows, i, airfoil, last_speeds, records)
+            i = add_force_rows(rows, i, airfoil, last_speeds, force_records)
+            continue
+
+        if is_pressure_header(row):
+            speed_ms = last_speeds[0] if last_speeds else None
+            i = add_pressure_rows(rows, i, airfoil, speed_ms, pressure_records)
             continue
 
         i += 1
 
-    output = []
-    for (profile, speed_ms, angle), values in records.items():
+    force_rows = []
+    for (profile, speed_ms, angle), values in force_records.items():
         lift_kg = mean(values["L_kg"])
         drag_kg = mean(values["D_kg"])
         if lift_kg is None or drag_kg is None:
             continue
 
-        output.append(
+        force_rows.append(
             {
                 "profil": profile,
                 "vitesse_ms": speed_ms,
@@ -160,56 +219,229 @@ def parse_data_file(csv_path: Path) -> list[dict[str, float | str | None]]:
                 "D_N": drag_kg * G,
             }
         )
+
+    pressure_rows = []
+    for (profile, speed_ms, angle), values in pressure_records.items():
+        pressure = mean(values)
+        if pressure is None:
+            continue
+
+        pressure_rows.append(
+            {
+                "profil": profile,
+                "vitesse_ms": speed_ms,
+                "angle_deg": angle,
+                "pression_PSI": pressure,
+            }
+        )
+
+    return sorted_rows(force_rows), sorted_rows(pressure_rows)
+
+
+def aggregate_force_rows(rows: list[dict[str, float | str | None]]) -> list[dict[str, float | str | None]]:
+    aggregated = defaultdict(lambda: {"L_kg": [], "D_kg": []})
+
+    for row in rows:
+        key = (
+            str(row["profil"]),
+            float(row["vitesse_ms"]),
+            float(row["angle_deg"]),
+        )
+        aggregated[key]["L_kg"].append(float(row["L_kg"]))
+        aggregated[key]["D_kg"].append(float(row["D_kg"]))
+
+    output = []
+    for (profile, speed_ms, angle_deg), values in aggregated.items():
+        lift_kg = mean(values["L_kg"])
+        drag_kg = mean(values["D_kg"])
+        if lift_kg is None or drag_kg is None:
+            continue
+
+        output.append(
+            {
+                "profil": profile,
+                "vitesse_ms": speed_ms,
+                "angle_deg": angle_deg,
+                "L_kg": lift_kg,
+                "D_kg": drag_kg,
+                "L_N": lift_kg * G,
+                "D_N": drag_kg * G,
+            }
+        )
+
     return sorted_rows(output)
 
 
-def interpolate_group(rows: list[dict[str, float | str | None]]) -> list[dict[str, float | str | None]]:
-    rows = sorted(rows, key=lambda row: float(row["angle_deg"]))
-    if len(rows) < 2:
-        return rows
+def aggregate_pressure_rows(rows: list[dict[str, float | str | None]]) -> list[dict[str, float | str | None]]:
+    aggregated = defaultdict(list)
 
-    measured_angles = [float(row["angle_deg"]) for row in rows]
-    out = []
-    angle = measured_angles[0]
-    max_angle = measured_angles[-1]
+    for row in rows:
+        key = (
+            str(row["profil"]),
+            float(row["vitesse_ms"]),
+            float(row["angle_deg"]),
+        )
+        aggregated[key].append(float(row["pression_PSI"]))
 
-    while angle <= max_angle + 1.0e-9:
-        lower_i = max(index for index, value in enumerate(measured_angles) if value <= angle + 1.0e-9)
-        upper_i = min(index for index, value in enumerate(measured_angles) if value >= angle - 1.0e-9)
-        lower = rows[lower_i]
-        upper = rows[upper_i]
-        a0 = float(lower["angle_deg"])
-        a1 = float(upper["angle_deg"])
+    output = []
+    for (profile, speed_ms, angle_deg), values in aggregated.items():
+        pressure = mean(values)
+        if pressure is None:
+            continue
 
-        new_row = {
-            "profil": TARGET_PROFILE,
-            "vitesse_ms": lower["vitesse_ms"],
-            "angle_deg": round(angle, 6),
-        }
+        output.append(
+            {
+                "profil": profile,
+                "vitesse_ms": speed_ms,
+                "angle_deg": angle_deg,
+                "pression_PSI": pressure,
+            }
+        )
 
-        for column in ("L_kg", "D_kg", "L_N", "D_N"):
-            v0 = float(lower[column])
-            v1 = float(upper[column])
-            if abs(a1 - a0) < 1.0e-12:
-                new_row[column] = v0
-            else:
-                t = (angle - a0) / (a1 - a0)
-                new_row[column] = v0 + t * (v1 - v0)
-
-        out.append(new_row)
-        angle += INTERPOLATION_STEP_DEG
-
-    return out
+    return sorted_rows(output)
 
 
-def interpolate_all(measured_rows: list[dict[str, float | str | None]]) -> list[dict[str, float | str | None]]:
-    groups = defaultdict(list)
-    for row in measured_rows:
-        groups[float(row["vitesse_ms"])].append(row)
+def linear_between(points: list[tuple[float, float]], x: float) -> float | None:
+    points = sorted(points)
+    for point_x, point_y in points:
+        if abs(point_x - x) < 1.0e-9:
+            return point_y
+
+    lower = [point for point in points if point[0] < x]
+    upper = [point for point in points if point[0] > x]
+    if not lower or not upper:
+        return None
+
+    x0, y0 = lower[-1]
+    x1, y1 = upper[0]
+    t = (x - x0) / (x1 - x0)
+    return y0 + t * (y1 - y0)
+
+
+def interpolate_same_speed(rows: list[dict[str, float | str | None]], speed: float, angle: float, column: str) -> float | None:
+    points = [
+        (float(row["angle_deg"]), float(row[column]))
+        for row in rows
+        if abs(float(row["vitesse_ms"]) - speed) < 1.0e-9 and row[column] is not None
+    ]
+    return linear_between(points, angle)
+
+
+def interpolate_same_angle(rows: list[dict[str, float | str | None]], speed: float, angle: float, column: str) -> float | None:
+    points = [
+        (float(row["vitesse_ms"]), float(row[column]))
+        for row in rows
+        if abs(float(row["angle_deg"]) - angle) < 1.0e-9 and row[column] is not None
+    ]
+    return linear_between(points, speed)
+
+
+def interpolate_inverse_distance(
+    rows: list[dict[str, float | str | None]],
+    speed: float,
+    angle: float,
+    column: str,
+) -> float | None:
+    speeds = [float(row["vitesse_ms"]) for row in rows]
+    angles = [float(row["angle_deg"]) for row in rows]
+    speed_scale = max(max(speeds) - min(speeds), 1.0)
+    angle_scale = max(max(angles) - min(angles), 1.0)
+
+    weighted_points = []
+    for row in rows:
+        if row[column] is None:
+            continue
+        du = (float(row["vitesse_ms"]) - speed) / speed_scale
+        da = (float(row["angle_deg"]) - angle) / angle_scale
+        distance = math.hypot(du, da)
+        if distance < 1.0e-12:
+            return float(row[column])
+        weighted_points.append((distance, float(row[column])))
+
+    if not weighted_points:
+        return None
+
+    nearest = sorted(weighted_points, key=lambda point: point[0])[:8]
+    weights = [1.0 / (distance * distance) for distance, _ in nearest]
+    values = [value for _, value in nearest]
+    return sum(weight * value for weight, value in zip(weights, values)) / sum(weights)
+
+
+def interpolate_value(rows: list[dict[str, float | str | None]], speed: float, angle: float, column: str) -> float | None:
+    exact_values = [
+        float(row[column])
+        for row in rows
+        if row[column] is not None
+        and abs(float(row["vitesse_ms"]) - speed) < 1.0e-9
+        and abs(float(row["angle_deg"]) - angle) < 1.0e-9
+    ]
+    if exact_values:
+        return mean(exact_values)
+
+    candidates = [
+        interpolate_same_speed(rows, speed, angle, column),
+        interpolate_same_angle(rows, speed, angle, column),
+    ]
+    candidates = [value for value in candidates if value is not None]
+    if candidates:
+        return sum(candidates) / len(candidates)
+
+    return interpolate_inverse_distance(rows, speed, angle, column)
+
+
+def interpolate_force_rows(measured_rows: list[dict[str, float | str | None]]) -> list[dict[str, float | str | None]]:
+    if not measured_rows:
+        return []
+
+    speeds = sorted({float(row["vitesse_ms"]) for row in measured_rows})
+    angles = frange(ANGLE_MIN_DEG, ANGLE_MAX_DEG, INTERPOLATION_STEP_DEG)
 
     interpolated = []
-    for group_rows in groups.values():
-        interpolated.extend(interpolate_group(group_rows))
+    for speed in speeds:
+        for angle in angles:
+            lift_kg = interpolate_value(measured_rows, speed, angle, "L_kg")
+            drag_kg = interpolate_value(measured_rows, speed, angle, "D_kg")
+            if lift_kg is None or drag_kg is None:
+                continue
+
+            interpolated.append(
+                {
+                    "profil": TARGET_PROFILE,
+                    "vitesse_ms": speed,
+                    "angle_deg": angle,
+                    "L_kg": lift_kg,
+                    "D_kg": drag_kg,
+                    "L_N": lift_kg * G,
+                    "D_N": drag_kg * G,
+                }
+            )
+
+    return sorted_rows(interpolated)
+
+
+def interpolate_pressure_rows(measured_rows: list[dict[str, float | str | None]]) -> list[dict[str, float | str | None]]:
+    if not measured_rows:
+        return []
+
+    speeds = sorted({float(row["vitesse_ms"]) for row in measured_rows})
+    angles = frange(ANGLE_MIN_DEG, ANGLE_MAX_DEG, INTERPOLATION_STEP_DEG)
+
+    interpolated = []
+    for speed in speeds:
+        for angle in angles:
+            pressure = interpolate_value(measured_rows, speed, angle, "pression_PSI")
+            if pressure is None:
+                continue
+
+            interpolated.append(
+                {
+                    "profil": TARGET_PROFILE,
+                    "vitesse_ms": speed,
+                    "angle_deg": angle,
+                    "pression_PSI": pressure,
+                }
+            )
+
     return sorted_rows(interpolated)
 
 
@@ -238,17 +470,29 @@ def safe_filename(value: float | str | None) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "_", text).strip("_")
 
 
-def write_output(path: Path, rows: list[dict[str, float | str | None]]) -> None:
+def write_output(path: Path, rows: list[dict[str, float | str | None]], columns: list[str]) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
         for row in sorted_rows(rows):
-            writer.writerow({column: format_cell(row.get(column)) for column in COLUMNS})
+            writer.writerow({column: format_cell(row.get(column)) for column in columns})
 
 
-def write_by_speed(root: Path, measured: list[dict[str, float | str | None]], interpolated: list[dict[str, float | str | None]]) -> None:
-    output_dir = root / OUTPUT_BY_SPEED
+def clear_csv_outputs(output_dir: Path) -> None:
     output_dir.mkdir(exist_ok=True)
+    for path in output_dir.glob("*.csv"):
+        path.unlink()
+
+
+def write_by_speed(
+    root: Path,
+    output_dir_name: str,
+    measured: list[dict[str, float | str | None]],
+    interpolated: list[dict[str, float | str | None]],
+    columns: list[str],
+) -> None:
+    output_dir = root / output_dir_name
+    clear_csv_outputs(output_dir)
 
     grouped_measured = defaultdict(list)
     grouped_interpolated = defaultdict(list)
@@ -259,27 +503,42 @@ def write_by_speed(root: Path, measured: list[dict[str, float | str | None]], in
         grouped_interpolated[float(row["vitesse_ms"])].append(row)
 
     for speed_ms, rows in grouped_measured.items():
-        write_output(output_dir / f"vitesse_{safe_filename(speed_ms)}_ms_mesures.csv", rows)
+        write_output(output_dir / f"vitesse_{safe_filename(speed_ms)}_ms_mesures.csv", rows, columns)
 
     for speed_ms, rows in grouped_interpolated.items():
-        write_output(output_dir / f"vitesse_{safe_filename(speed_ms)}_ms_interpoles.csv", rows)
+        write_output(output_dir / f"vitesse_{safe_filename(speed_ms)}_ms_interpoles.csv", rows, columns)
 
 
 def main() -> None:
     root = Path(__file__).resolve().parent
-    measured = []
+    force_raw = []
+    pressure_raw = []
+
     for csv_path in root.rglob("data.csv"):
-        measured.extend(parse_data_file(csv_path))
+        force_rows, pressure_rows = parse_data_file(csv_path)
+        force_raw.extend(force_rows)
+        pressure_raw.extend(pressure_rows)
 
-    measured = sorted_rows(measured)
-    interpolated = interpolate_all(measured)
-    write_by_speed(root, measured, interpolated)
+    force_measured = aggregate_force_rows(force_raw)
+    pressure_measured = aggregate_pressure_rows(pressure_raw)
+    force_interpolated = interpolate_force_rows(force_measured)
+    pressure_interpolated = interpolate_pressure_rows(pressure_measured)
 
-    speeds = sorted({float(row["vitesse_ms"]) for row in measured})
-    print(f"{len(measured)} lignes mesurees {TARGET_PROFILE}")
-    print(f"{len(interpolated)} lignes interpolees {TARGET_PROFILE}")
-    print(f"Vitesses traitees: {', '.join(format_cell(speed) for speed in speeds)} m/s")
-    print(f"Fichiers -> {OUTPUT_BY_SPEED}/")
+    write_by_speed(root, FORCE_DIR, force_measured, force_interpolated, FORCE_COLUMNS)
+    write_by_speed(root, PRESSURE_DIR, pressure_measured, pressure_interpolated, PRESSURE_COLUMNS)
+
+    speeds_force = sorted({float(row["vitesse_ms"]) for row in force_measured})
+    speeds_pressure = sorted({float(row["vitesse_ms"]) for row in pressure_measured})
+    print(f"Forces brutes lues: {len(force_raw)} lignes {TARGET_PROFILE}")
+    print(f"Forces mesurees moyennees: {len(force_measured)} lignes {TARGET_PROFILE}")
+    print(f"Forces interpolees: {len(force_interpolated)} lignes entre {ANGLE_MIN_DEG:g} et {ANGLE_MAX_DEG:g} deg")
+    print(f"Pressions brutes lues: {len(pressure_raw)} lignes {TARGET_PROFILE}")
+    print(f"Pressions mesurees moyennees: {len(pressure_measured)} lignes {TARGET_PROFILE}")
+    print(f"Pressions interpolees: {len(pressure_interpolated)} lignes entre {ANGLE_MIN_DEG:g} et {ANGLE_MAX_DEG:g} deg")
+    print(f"Vitesses force: {', '.join(format_cell(speed) for speed in speeds_force)} m/s")
+    print(f"Vitesses pression: {', '.join(format_cell(speed) for speed in speeds_pressure)} m/s")
+    print(f"Fichiers force -> {FORCE_DIR}/")
+    print(f"Fichiers pression -> {PRESSURE_DIR}/")
 
 
 if __name__ == "__main__":
